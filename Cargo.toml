@@ -1,0 +1,10 @@
+[package]
+name = "redirect_tool"
+version = "0.1.0"
+edition = "2018"
+
+[dependencies]
+tokio = { version = "1.28.0", features = ["full"] }
+clap = "4.3.0"
+anyhow = "1.0.71"
+rand = "0.8.5"

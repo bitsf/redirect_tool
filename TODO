@@ -1,0 +1,4 @@
+- when new ip connected, ask for password
+- after validate password, save current ip as valid in memory
+- close connection after validate password first time
+- when valid ip connected, redirect payload
