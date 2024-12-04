@@ -5,6 +5,8 @@ use anyhow::{Result, Context};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::time::{timeout, Duration};
+use std::collections::VecDeque;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -40,22 +42,41 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(listen_addr).await
         .context("Failed to bind to address")?;
     let user_map = Arc::new(Mutex::new(HashMap::new()));
+    let blacklist = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         let (socket, addr) = listener.accept().await?;
         let forward_addr = forward_addr.to_string();
         let password = password.to_string();
-        let user_map = Arc::clone(&user_map);
+        let user_map: Arc<Mutex<HashMap<String, ()>>> = Arc::clone(&user_map);
+        let blacklist: Arc<Mutex<HashMap<String, (u32, u64, u64)>>> = Arc::clone(&blacklist);
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, addr.ip().to_string(), forward_addr, password, user_map).await {
+            if let Err(e) = handle_connection(socket, addr.ip().to_string(), forward_addr, password, user_map, blacklist).await {
                 eprintln!("Failed to handle connection: {}", e);
             }
         });
     }
 }
 
-async fn handle_connection(mut socket: TcpStream, addr: String, forward_addr: String, password: String, user_map: Arc<Mutex<HashMap<String, ()>>>) -> Result<()> {
+async fn handle_connection(mut socket: TcpStream, addr: String, forward_addr: String, password: String, user_map: Arc<Mutex<HashMap<String, ()>>>, blacklist: Arc<Mutex<HashMap<String, (u32, u64, u64)>>>) -> Result<()> {
+    {
+        let should_ban = {
+            let blacklist = blacklist.lock().unwrap();
+            let result = if let Some((count, _, _)) = blacklist.get(&addr) {
+                *count >= 3
+            } else {
+                false
+            };
+            result
+        };
+
+        if should_ban {
+            println!("{} is banned", addr);
+            return Ok(());
+        }
+    }
+
     let is_authenticated = {
         let users = user_map.lock().unwrap();
         users.contains_key(&addr)
@@ -84,7 +105,11 @@ async fn handle_connection(mut socket: TcpStream, addr: String, forward_addr: St
     let input_password = String::from_utf8_lossy(&buf[..n]).trim().to_string();
 
     if input_password != password {
-        println!("{} failed to authenticate", addr);
+        let mut blacklist = blacklist.lock().unwrap();
+        let entry = blacklist.entry(addr.clone()).or_insert((0, SystemTime::now().elapsed().unwrap().as_secs(), SystemTime::now().elapsed().unwrap().as_secs()));
+        entry.0 += 1;
+
+        println!("{} failed to authenticate {} times", addr, entry.0);
         return Ok(());
     }
 
