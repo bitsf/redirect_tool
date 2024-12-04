@@ -1,4 +1,3 @@
-
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use clap::{Command, Arg};
@@ -49,7 +48,7 @@ async fn main() -> Result<()> {
         let user_map = Arc::clone(&user_map);
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, addr.to_string(), forward_addr, password, user_map).await {
+            if let Err(e) = handle_connection(socket, addr.ip().to_string(), forward_addr, password, user_map).await {
                 eprintln!("Failed to handle connection: {}", e);
             }
         });
@@ -57,12 +56,35 @@ async fn main() -> Result<()> {
 }
 
 async fn handle_connection(mut socket: TcpStream, addr: String, forward_addr: String, password: String, user_map: Arc<Mutex<HashMap<String, ()>>>) -> Result<()> {
+    let is_authenticated = {
+        let users = user_map.lock().unwrap();
+        users.contains_key(&addr)
+    };
+
+    if is_authenticated {
+        println!("{} already authenticated", addr);
+        // IP already authenticated, allow forwarding
+        let mut forward_socket = TcpStream::connect(forward_addr).await
+            .context("Failed to connect to forward address")?;
+
+        tokio::spawn(async move {
+            let _ = timeout(Duration::from_secs(300), async {
+                tokio::io::copy_bidirectional(&mut socket, &mut forward_socket).await
+            }).await;
+        });
+
+        return Ok(());
+    }
+
+    println!("{} not authenticated", addr);
+    socket.write_all(b"please input password: ").await?;
+
     let mut buf = [0; 1024];
     let n = socket.read(&mut buf).await?;
     let input_password = String::from_utf8_lossy(&buf[..n]).trim().to_string();
 
     if input_password != password {
-        socket.write_all(b"Invalid password\n").await?;
+        println!("{} failed to authenticate", addr);
         return Ok(());
     }
 
@@ -71,19 +93,9 @@ async fn handle_connection(mut socket: TcpStream, addr: String, forward_addr: St
         users.insert(addr.clone(), ());
     }
 
-    let mut forward_socket = TcpStream::connect(forward_addr).await
-        .context("Failed to connect to forward address")?;
-
-    tokio::spawn(async move {
-        let _ = timeout(Duration::from_secs(300), async {
-            tokio::io::copy_bidirectional(&mut socket, &mut forward_socket).await
-        }).await;
-        
-        let mut users = user_map.lock().unwrap();
-        users.remove(&addr);
-    });
-
-    Ok(())
+    println!("{} authenticated", addr);
+    socket.write_all(b"validated\n").await?;
+    return Ok(());
 }
 
 fn generate_random_password() -> String {

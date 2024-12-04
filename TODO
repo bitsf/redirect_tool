@@ -1,4 +1,4 @@
-- when new ip connected, ask for password
-- after validate password, save current ip as valid in memory
-- close connection after validate password first time
-- when valid ip connected, redirect payload
+- 防止特定ip在一段时间内多次验证密码，即防止DDOS攻击
+- 一段时间后如果没有流量则ip失效，启动单独线程定时扫描
+- 定期统计ip速度和流量
+- 可以使用TOTP动态密钥
