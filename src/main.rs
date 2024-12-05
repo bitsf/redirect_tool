@@ -49,6 +49,19 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to bind to address")?;
     let user_map = Arc::new(Mutex::new(HashMap::new()));
+    let user_map_cleanup = Arc::clone(&user_map);
+
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            println!("Cleaning up user map");
+            let current_time = now.elapsed().unwrap().as_secs();
+            let mut users = user_map_cleanup.lock().unwrap();
+            users.retain(|_, &mut (_, update_time)| current_time - update_time <= 3600);
+            println!("remaining users: {}", users.len());
+        }
+    });
+
     let blacklist = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
