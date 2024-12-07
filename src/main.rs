@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
-use clap::{Arg, Command};
+use clap::{Arg, Command, ArgAction};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Duration;
+use totp_rs::{Algorithm, Secret, TOTP};
 
 const SCAN_TIME: u64 = 60;
 const CLEAN_TIME: u64 = 3600;
@@ -43,11 +44,18 @@ async fn main() -> Result<()> {
                 .help("The preset password")
                 .num_args(1),
         )
+        .arg(
+            Arg::new("totp")
+                .long("totp")
+                .help("Use TOTP for authentication")
+                .action(clap::ArgAction::SetTrue),
+        )
         .get_matches();
 
     let listen_addr = matches.get_one::<String>("listen").unwrap();
     let forward_addr = matches.get_one::<String>("forward").unwrap();
-    let password = if let Some(p) = matches.get_one::<String>("password") {
+    let use_totp = matches.get_flag("totp");
+    let password =  if let Some(p) = matches.get_one::<String>("password") {
         p.to_string()
     } else {
         let random_password = generate_random_password();
@@ -55,12 +63,49 @@ async fn main() -> Result<()> {
         random_password
     };
 
+    let totp = if use_totp {
+        let password = {
+            if password.len() <16 {
+                password.clone()+
+                (&"0".repeat(16 - &password.len()))
+            } else {
+                password.clone()
+            }
+        };
+        let bytes = Secret::Raw(password.as_bytes().to_vec())
+            .to_bytes()
+            .unwrap();
+        let totp = TOTP::new(
+            Algorithm::SHA1,
+            6,
+            1,
+            30,
+            bytes,
+            None,
+            "redirect_code".to_string(),
+        )
+        .unwrap();
+
+        let url = totp.get_url();
+        use qrcode::QrCode;
+        let code = QrCode::new(&url).unwrap();
+        let qrimg = code.render().light_color("  ").dark_color("██").build();
+        println!("{}", qrimg);
+        println!("{}", url);
+
+        Some(Arc::new(totp))
+    } else {
+        None
+    };
+
     let listener = TcpListener::bind(listen_addr)
         .await
         .context("Failed to bind to address")?;
+    println!("Listening on: {}, redirect to {}", listen_addr, forward_addr);
     let user_map: Arc<Mutex<HashMap<String, UserInfo>>> = Arc::new(Mutex::new(HashMap::new()));
     let user_map_cleanup = Arc::clone(&user_map);
     let blacklist = Arc::new(Mutex::new(HashMap::new()));
+    let blacklist_cleanup = Arc::clone(&blacklist);
 
     tokio::spawn(async move {
         loop {
@@ -72,23 +117,23 @@ async fn main() -> Result<()> {
             users.retain(|_, user_info| {
                 user_info.count > 0 || current_time - user_info.update_time <= CLEAN_TIME
             });
-            if old_user_count!= users.len(){
+            if old_user_count != users.len() {
                 println!("remaining users: {} -> {}", old_user_count, users.len());
             }
 
             // clean up blacklist
-            let mut blacklist = blacklist.lock().unwrap();
+            let mut blacklist = blacklist_cleanup.lock().unwrap();
             let old_blacklist_count = blacklist.len();
-            blacklist.retain(|_, (_, _, update_time)| {
-                current_time - *update_time <= BAN_TIME
-            });
-            if old_blacklist_count != blacklist.len(){
-                println!("remaining blacklist: {} -> {}", old_blacklist_count, blacklist.len());
+            blacklist.retain(|_, (_, _, update_time)| current_time - *update_time <= BAN_TIME);
+            if old_blacklist_count != blacklist.len() {
+                println!(
+                    "remaining blacklist: {} -> {}",
+                    old_blacklist_count,
+                    blacklist.len()
+                );
             }
         }
     });
-
-    
 
     loop {
         let (socket, addr) = listener.accept().await?;
@@ -96,6 +141,7 @@ async fn main() -> Result<()> {
         let password = password.to_string();
         let user_map: Arc<Mutex<HashMap<String, UserInfo>>> = Arc::clone(&user_map);
         let blacklist: Arc<Mutex<HashMap<String, (u32, u64, u64)>>> = Arc::clone(&blacklist);
+        let totp = totp.clone();
 
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
@@ -106,6 +152,7 @@ async fn main() -> Result<()> {
                 password,
                 user_map,
                 blacklist,
+                totp,
             )
             .await
             {
@@ -128,7 +175,11 @@ impl Drop for OneConn {
             let current_time = self.now.elapsed().unwrap().as_secs();
             println!(
                 "{} close conn {} at {} -> {} -> {}",
-                self.addr, user_info.count, user_info.create_time, user_info.update_time, current_time
+                self.addr,
+                user_info.count,
+                user_info.create_time,
+                user_info.update_time,
+                current_time
             );
             user_info.count -= 1;
             user_info.update_time = current_time;
@@ -144,6 +195,7 @@ async fn handle_connection(
     password: String,
     user_map: Arc<Mutex<HashMap<String, UserInfo>>>,
     blacklist: Arc<Mutex<HashMap<String, (u32, u64, u64)>>>,
+    totp: Option<Arc<TOTP>>,
 ) -> Result<()> {
     {
         let should_ban = {
@@ -193,7 +245,9 @@ async fn handle_connection(
 
         tokio::spawn(async move {
             let _one_conn = one_conn;
-            tokio::io::copy_bidirectional(&mut socket, &mut forward_socket).await.unwrap();
+            tokio::io::copy_bidirectional(&mut socket, &mut forward_socket)
+                .await
+                .unwrap();
             println!("{} disconnected", addr);
         });
 
@@ -207,7 +261,14 @@ async fn handle_connection(
     let n = socket.read(&mut buf).await?;
     let input_password = String::from_utf8_lossy(&buf[..n]).trim().to_string();
 
-    if input_password != password {
+    let is_valid_password = if let Some(totp) = &totp {
+        totp.check_current(&input_password).unwrap()
+    } else {
+        input_password == password
+    };
+
+    println!("is_valid_password {}", is_valid_password);
+    if !is_valid_password {
         let mut blacklist = blacklist.lock().unwrap();
         let entry = blacklist.entry(addr.clone()).or_insert((
             0,
