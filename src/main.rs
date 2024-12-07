@@ -9,6 +9,7 @@ use tokio::time::Duration;
 
 const SCAN_TIME: u64 = 60;
 const CLEAN_TIME: u64 = 3600;
+const BAN_TIME: u64 = 3600;
 
 struct UserInfo {
     count: u32,
@@ -59,11 +60,13 @@ async fn main() -> Result<()> {
         .context("Failed to bind to address")?;
     let user_map: Arc<Mutex<HashMap<String, UserInfo>>> = Arc::new(Mutex::new(HashMap::new()));
     let user_map_cleanup = Arc::clone(&user_map);
+    let blacklist = Arc::new(Mutex::new(HashMap::new()));
 
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(SCAN_TIME)).await;
             let current_time = now.elapsed().unwrap().as_secs();
+            // clean up user_map
             let mut users = user_map_cleanup.lock().unwrap();
             let old_user_count = users.len();
             users.retain(|_, user_info| {
@@ -72,10 +75,20 @@ async fn main() -> Result<()> {
             if old_user_count!= users.len(){
                 println!("remaining users: {} -> {}", old_user_count, users.len());
             }
+
+            // clean up blacklist
+            let mut blacklist = blacklist.lock().unwrap();
+            let old_blacklist_count = blacklist.len();
+            blacklist.retain(|_, (_, _, update_time)| {
+                current_time - *update_time <= BAN_TIME
+            });
+            if old_blacklist_count != blacklist.len(){
+                println!("remaining blacklist: {} -> {}", old_blacklist_count, blacklist.len());
+            }
         }
     });
 
-    let blacklist = Arc::new(Mutex::new(HashMap::new()));
+    
 
     loop {
         let (socket, addr) = listener.accept().await?;
