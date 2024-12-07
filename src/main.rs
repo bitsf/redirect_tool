@@ -5,7 +5,16 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{timeout, Duration};
+use tokio::time::Duration;
+
+const SCAN_TIME: u64 = 60;
+const CLEAN_TIME: u64 = 3600;
+
+struct UserInfo {
+    count: u32,
+    create_time: u64,
+    update_time: u64,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -48,17 +57,21 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(listen_addr)
         .await
         .context("Failed to bind to address")?;
-    let user_map = Arc::new(Mutex::new(HashMap::new()));
+    let user_map: Arc<Mutex<HashMap<String, UserInfo>>> = Arc::new(Mutex::new(HashMap::new()));
     let user_map_cleanup = Arc::clone(&user_map);
 
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            println!("Cleaning up user map");
+            tokio::time::sleep(Duration::from_secs(SCAN_TIME)).await;
             let current_time = now.elapsed().unwrap().as_secs();
             let mut users = user_map_cleanup.lock().unwrap();
-            users.retain(|_, &mut (_, update_time)| current_time - update_time <= 3600);
-            println!("remaining users: {}", users.len());
+            let old_user_count = users.len();
+            users.retain(|_, user_info| {
+                user_info.count > 0 || current_time - user_info.update_time <= CLEAN_TIME
+            });
+            if old_user_count!= users.len(){
+                println!("remaining users: {} -> {}", old_user_count, users.len());
+            }
         }
     });
 
@@ -68,7 +81,7 @@ async fn main() -> Result<()> {
         let (socket, addr) = listener.accept().await?;
         let forward_addr = forward_addr.to_string();
         let password = password.to_string();
-        let user_map: Arc<Mutex<HashMap<String, (u64, u64)>>> = Arc::clone(&user_map);
+        let user_map: Arc<Mutex<HashMap<String, UserInfo>>> = Arc::clone(&user_map);
         let blacklist: Arc<Mutex<HashMap<String, (u32, u64, u64)>>> = Arc::clone(&blacklist);
 
         tokio::spawn(async move {
@@ -89,13 +102,34 @@ async fn main() -> Result<()> {
     }
 }
 
+struct OneConn {
+    now: SystemTime,
+    addr: String,
+    user_map: Arc<Mutex<HashMap<String, UserInfo>>>,
+}
+
+impl Drop for OneConn {
+    fn drop(&mut self) {
+        let mut users = self.user_map.lock().unwrap();
+        if let Some(user_info) = users.get_mut(&self.addr) {
+            let current_time = self.now.elapsed().unwrap().as_secs();
+            println!(
+                "{} close conn {} at {} -> {} -> {}",
+                self.addr, user_info.count, user_info.create_time, user_info.update_time, current_time
+            );
+            user_info.count -= 1;
+            user_info.update_time = current_time;
+        };
+    }
+}
+
 async fn handle_connection(
     now: SystemTime,
     mut socket: TcpStream,
     addr: String,
     forward_addr: String,
     password: String,
-    user_map: Arc<Mutex<HashMap<String, (u64, u64)>>>,
+    user_map: Arc<Mutex<HashMap<String, UserInfo>>>,
     blacklist: Arc<Mutex<HashMap<String, (u32, u64, u64)>>>,
 ) -> Result<()> {
     {
@@ -117,13 +151,14 @@ async fn handle_connection(
 
     let is_authenticated = {
         let mut users = user_map.lock().unwrap();
-        let result = if let Some((create_time, update_time)) = users.get_mut(&addr) {
+        let result = if let Some(user_info) = users.get_mut(&addr) {
             let current_time = now.elapsed().unwrap().as_secs();
             println!(
-                "{} already authenticated at {} -> {} -> {}",
-                addr, create_time, update_time, current_time
+                "{} already authenticated {} at {} -> {} -> {}",
+                addr, user_info.count, user_info.create_time, user_info.update_time, current_time
             );
-            *update_time = current_time;
+            user_info.update_time = current_time;
+            user_info.count += 1;
             true
         } else {
             false
@@ -137,11 +172,16 @@ async fn handle_connection(
             .await
             .context("Failed to connect to forward address")?;
 
+        let one_conn = OneConn {
+            now: now,
+            addr: addr.clone(),
+            user_map: user_map,
+        };
+
         tokio::spawn(async move {
-            let _ = timeout(Duration::from_secs(300), async {
-                tokio::io::copy_bidirectional(&mut socket, &mut forward_socket).await
-            })
-            .await;
+            let _one_conn = one_conn;
+            tokio::io::copy_bidirectional(&mut socket, &mut forward_socket).await.unwrap();
+            println!("{} disconnected", addr);
         });
 
         return Ok(());
@@ -170,10 +210,11 @@ async fn handle_connection(
 
     {
         let mut users = user_map.lock().unwrap();
-        users.entry(addr.clone()).or_insert((
-            now.elapsed().unwrap().as_secs(),
-            now.elapsed().unwrap().as_secs(),
-        ));
+        users.entry(addr.clone()).or_insert(UserInfo {
+            count: 0,
+            create_time: now.elapsed().unwrap().as_secs(),
+            update_time: now.elapsed().unwrap().as_secs(),
+        });
     }
 
     println!("{} authenticated", addr);
