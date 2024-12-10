@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
             Arg::new("totp")
                 .long("totp")
                 .help("Use TOTP for authentication")
-                .action(clap::ArgAction::SetTrue),
+                .action(ArgAction::SetTrue),
         )
         .get_matches();
 
@@ -64,13 +64,10 @@ async fn main() -> Result<()> {
     };
 
     let totp = if use_totp {
-        let password = {
-            if password.len() <16 {
-                password.clone()+
-                (&"0".repeat(16 - &password.len()))
-            } else {
-                password.clone()
-            }
+        let password = if password.len() < 16 {
+            password.clone() + &"0".repeat(16 - password.len())
+        } else {
+            password.clone()
         };
         let bytes = Secret::Raw(password.as_bytes().to_vec())
             .to_bytes()
@@ -84,11 +81,11 @@ async fn main() -> Result<()> {
             None,
             "redirect_code".to_string(),
         )
-        .unwrap();
+        .context("Failed to create TOTP")?;
 
         let url = totp.get_url();
         use qrcode::QrCode;
-        let code = QrCode::new(&url).unwrap();
+        let code = QrCode::new(&url).context("Failed to generate QR code")?;
         let qrimg = code.render().light_color("  ").dark_color("██").build();
         println!("{}", qrimg);
         println!("{}", url);
